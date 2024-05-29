@@ -304,7 +304,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (3B).
 
-
 	return index, term, isLeader
 }
 
@@ -341,6 +340,35 @@ func waitTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
     }
 }
 
+func (rf *Raft) dispatchLogLoop() {
+	for !rf.killed() {
+		rf.mu.Lock()
+
+		if rf.state == Leader {
+			logDispatchWaitGroup := sync.WaitGroup{}
+			//var logDispatchedCount int32 = 0
+
+			for i := range rf.peers {
+				if i == rf.me {
+					continue
+				}
+
+				logDispatchWaitGroup.Add(1)
+
+				go func (index int) {
+					defer logDispatchWaitGroup.Done()
+				}(i)
+			}
+
+			waitTimeout(&logDispatchWaitGroup, time.Second)
+		}
+
+		rf.mu.Unlock()
+
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 func (rf *Raft) heartbeatLoop() {
 	for !rf.killed() {
 		rf.mu.Lock()
@@ -360,12 +388,8 @@ func (rf *Raft) heartbeatLoop() {
 					defer heartbeatWaitGroup.Done()
 
 					req := AppendEntriesArgs {
-						rf.currentTerm,
-						rf.me,
-						rf.nextIndex[index] - 1,
-						0,
-						nil,
-						rf.commitIndex,
+						Term: rf.currentTerm,
+						LeaderId: rf.me,
 					}
 
 					if req.PrevLogIndex > 0 {
@@ -528,7 +552,7 @@ func Make(peers []*labrpc.ClientEnd,
 	rf.votedFor = nil
 
 	rf.commitIndex = 0
-	rf.lastApplied = -1
+	rf.lastApplied = 0
 
 	rf.log = make([]LogEntry, 0)
 	rf.nextIndex = make([]int, len(peers))
@@ -538,6 +562,7 @@ func Make(peers []*labrpc.ClientEnd,
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
+	go rf.dispatchLogLoop()
 	go rf.heartbeatLoop()
 	go rf.ticker()
 
