@@ -59,6 +59,11 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type LogEntry struct {
+	Command interface{}
+	Term    int
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -74,7 +79,7 @@ type Raft struct {
 	// state a Raft server must maintain.
 	currentTerm int
 	votedFor    *int
-	log 	    []interface{}
+	log 	    []LogEntry
 
 	// volatile states
 	electionTimer time.Time
@@ -91,13 +96,14 @@ type AppendEntriesArgs struct {
 	LeaderId int
 	PrevLogIndex int
 	PrevLogTerm int
-	Entries []interface{}
+	Entries []LogEntry
 	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
 	Term int
 	Success bool
+	CommitIndex int
 }
 
 // return currentTerm and whether this server
@@ -211,6 +217,7 @@ func (rf *Raft) OnAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRep
 		*reply = AppendEntriesReply{
 			rf.currentTerm,
 			false,
+			0,
 		}
 		return
 	}
@@ -223,6 +230,7 @@ func (rf *Raft) OnAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRep
 	*reply = AppendEntriesReply{
 		rf.currentTerm,
 		true,
+		0,
 	}
 }
 
@@ -279,7 +287,18 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	index := rf.commitIndex
+	if rf.state != Leader {
+		return -1, -1, false
+	}
+
+	entry := LogEntry {
+		command,
+		rf.currentTerm,
+	}
+
+	rf.log = append(rf.log, entry)
+
+	index := len(rf.log)
 	term := rf.currentTerm
 	isLeader := rf.state == Leader
 
@@ -328,7 +347,7 @@ func (rf *Raft) heartbeatLoop() {
 
 		if rf.state == Leader {
 			heartbeatWaitGroup := sync.WaitGroup{}
-			heartbeatFailureCount := 0
+			var heartbeatFailureCount int32 = 0
 
 			for i := range rf.peers {
 				if i == rf.me {
@@ -343,17 +362,27 @@ func (rf *Raft) heartbeatLoop() {
 					req := AppendEntriesArgs {
 						rf.currentTerm,
 						rf.me,
-						-1,
-						-1,
+						rf.nextIndex[index] - 1,
+						0,
 						nil,
-						-1,
+						rf.commitIndex,
 					}
+
+					if req.PrevLogIndex > 0 {
+						req.PrevLogTerm = rf.log[req.PrevLogIndex].Term
+					}
+
+					if rf.nextIndex[index] < len(rf.log) {
+						entries := rf.log[rf.nextIndex[index]:]
+						req.Entries = entries
+					}
+
 					res := AppendEntriesReply{}
 
 					succeeded := rf.sendAppendEntries(index, &req, &res)
 					
 					if !succeeded {
-						heartbeatFailureCount++
+						atomic.AddInt32(&heartbeatFailureCount, 1)
 					}
 
 					if res.Term > rf.currentTerm {
@@ -366,10 +395,10 @@ func (rf *Raft) heartbeatLoop() {
 				}(i)
 			}
 
-			waitTimeout(&heartbeatWaitGroup, Election_Timeout_Max)
+			waitTimeout(&heartbeatWaitGroup, time.Second)
 			// heartbeatWaitGroup.Wait()
 
-			if heartbeatFailureCount > len(rf.peers) / 2 && rf.state == Leader {
+			if int(atomic.LoadInt32(&heartbeatFailureCount)) > len(rf.peers) / 2 && rf.state == Leader {
 				rf.state = Follower
 				rf.votedFor = nil
 				log.Printf("Leader %v downgraded because of failure in heartbeat responses: [Failed %v/Total %v]", rf.me, heartbeatFailureCount, len(rf.peers))
@@ -395,7 +424,7 @@ func (rf *Raft) ticker() {
 			rf.electionTimer = time.Now()
 			rf.votedFor = &rf.me
 
-			voteGranted := 1
+			var voteGranted int32 = 1
 
 			// send vote req in parallel to all servers
 			for rf.state == Candidate {
@@ -438,15 +467,15 @@ func (rf *Raft) ticker() {
 						}
 
 						if res.VoteGranted {
-							voteGranted++
+							atomic.AddInt32(&voteGranted, 1)
 						}
 					}(i)
 				}
 
-				waitTimeout(&voteWaitGroup, Election_Timeout_Max)
+				waitTimeout(&voteWaitGroup, time.Second)
 				// voteWaitGroup.Wait()
 
-				if voteGranted > len(rf.peers) / 2 {
+				if int(atomic.LoadInt32(&voteGranted)) > len(rf.peers) / 2 {
 					log.Printf("Vote result: %v/%v", voteGranted, len(rf.peers))
 
 					// become leader
@@ -499,7 +528,11 @@ func Make(peers []*labrpc.ClientEnd,
 	rf.votedFor = nil
 
 	rf.commitIndex = 0
-	rf.lastApplied = 0
+	rf.lastApplied = -1
+
+	rf.log = make([]LogEntry, 0)
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
